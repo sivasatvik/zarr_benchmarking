@@ -151,7 +151,7 @@ def generate_graphs(results: list, output_dir: str):
 
 if __name__ == "__main__":
     ROOT_DIR = "./hg38_benchmark_data"
-    NUM_REQUESTS = 1000
+    NUM_REQUESTS = 2000
     WINDOW_SIZE = 4096
     
     CHUNK_SIZES = {
