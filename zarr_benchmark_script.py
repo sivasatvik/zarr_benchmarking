@@ -120,31 +120,31 @@ def generate_graphs(results: list, output_dir: str):
     sns.set_theme(style="whitegrid")
     
     # 1. Throughput Graph
-    plt.figure(figsize=(12, 6))
+    plt.figure(figsize=(13, 6))
     sns.barplot(data=df, x="Architecture", y="Throughput (MB/s)", hue="Layout", palette="Set2", errorbar=None)
     sns.stripplot(data=df, x="Architecture", y="Throughput (MB/s)", hue="Layout", palette="Set2", 
                   dodge=True, alpha=0.6, size=5, legend=False)
     plt.title("GPFS Direct I/O Benchmark: Logical Throughput", fontsize=14, pad=15)
     plt.ylabel("Throughput (MB/s)", fontsize=12)
     plt.xlabel("Encoding Architecture", fontsize=12)
-    plt.legend(title="Data Layout", loc="upper right")
-    plt.tight_layout()
+    plt.legend(title="Data Layout", loc="upper left", bbox_to_anchor=(1.02, 1), borderaxespad=0)
+    plt.tight_layout(rect=[0, 0, 0.82, 1])
     throughput_path = os.path.join(output_dir, f"benchmark_throughput_multi_{timestamp}.png")
-    plt.savefig(throughput_path, dpi=300)
+    plt.savefig(throughput_path, dpi=300, bbox_inches="tight")
     plt.close()
     
     # 2. Latency Graph (p99)
-    plt.figure(figsize=(12, 6))
+    plt.figure(figsize=(13, 6))
     sns.barplot(data=df, x="Architecture", y="p99 Latency (ms)", hue="Layout", palette="tab10", errorbar=None)
     sns.stripplot(data=df, x="Architecture", y="p99 Latency (ms)", hue="Layout", palette="tab10", 
                   dodge=True, alpha=0.6, size=5, legend=False)
     plt.title("GPFS Direct I/O Benchmark: 99th Percentile Latency", fontsize=14, pad=15)
     plt.ylabel("Latency (ms) - Lower is better", fontsize=12)
     plt.xlabel("Encoding Architecture", fontsize=12)
-    plt.legend(title="Data Layout", loc="upper right")
-    plt.tight_layout()
+    plt.legend(title="Data Layout", loc="upper left", bbox_to_anchor=(1.02, 1), borderaxespad=0)
+    plt.tight_layout(rect=[0, 0, 0.82, 1])
     latency_path = os.path.join(output_dir, f"benchmark_latency_multi_{timestamp}.png")
-    plt.savefig(latency_path, dpi=300)
+    plt.savefig(latency_path, dpi=300, bbox_inches="tight")
     plt.close()
     
     print(f"Saved: {throughput_path}")
@@ -173,7 +173,7 @@ if __name__ == "__main__":
     requests = [("chr1", start, WINDOW_SIZE) for start in starts]
 
     print("=" * 72)
-    print("             GPFS DIRECT I/O BENCHMARK RESULTS (SSD)")
+    print("             GPFS DIRECT I/O BENCHMARK RESULTS")
     print("             Running 3 iterations per configuration")
     print("=" * 72)
     print(f"{'Architecture':<12} | {'Data Layout':<11} | {'Logical T/P':>10} | {'Avg Latency':>14} | {'p99 Latency':>14}")
