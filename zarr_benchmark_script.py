@@ -2,6 +2,7 @@ import os
 import mmap
 import time
 import math
+from datetime import datetime
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -113,6 +114,7 @@ def generate_graphs(results: list, output_dir: str):
     """Generates and saves bar plots from the benchmark results with individual run points."""
     print("\nGenerating graphs...")
     df = pd.DataFrame(results)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
     # Set plot style
     sns.set_theme(style="whitegrid")
@@ -127,7 +129,7 @@ def generate_graphs(results: list, output_dir: str):
     plt.xlabel("Encoding Architecture", fontsize=12)
     plt.legend(title="Data Layout", loc="upper right")
     plt.tight_layout()
-    throughput_path = os.path.join(output_dir, "benchmark_throughput_multi.png")
+    throughput_path = os.path.join(output_dir, f"benchmark_throughput_multi_{timestamp}.png")
     plt.savefig(throughput_path, dpi=300)
     plt.close()
     
@@ -141,7 +143,7 @@ def generate_graphs(results: list, output_dir: str):
     plt.xlabel("Encoding Architecture", fontsize=12)
     plt.legend(title="Data Layout", loc="upper right")
     plt.tight_layout()
-    latency_path = os.path.join(output_dir, "benchmark_latency_multi.png")
+    latency_path = os.path.join(output_dir, f"benchmark_latency_multi_{timestamp}.png")
     plt.savefig(latency_path, dpi=300)
     plt.close()
     
@@ -178,7 +180,7 @@ if __name__ == "__main__":
     print("-" * 72)
     
     all_results = []
-    NUM_ITERATIONS = 3
+    NUM_ITERATIONS = 1
     
     # Run benchmarks 3 times for each architecture with mmap
     for iteration in range(NUM_ITERATIONS):
