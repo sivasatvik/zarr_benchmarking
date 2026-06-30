@@ -354,13 +354,18 @@ def generate_requests(chromosomes, num_requests, window_bases, seed):
 def read_chunk(chunk_dir, arch, chrom, component, index, compressor, drop_page_cache):
     path = chunk_dir / chunk_file_name(arch, chrom, component, index)
     with path.open("rb") as handle:
+        read_start = time.perf_counter()
         data = handle.read()
+        read_seconds = time.perf_counter() - read_start
         if drop_page_cache and hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
             try:
                 os.posix_fadvise(handle.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
             except OSError:
                 pass
-        return compressor.decompress(data)
+        decompress_start = time.perf_counter()
+        chunk = compressor.decompress(data)
+        decompress_seconds = time.perf_counter() - decompress_start
+        return chunk, read_seconds, decompress_seconds
 
 
 def read_encoded_window(
@@ -377,13 +382,19 @@ def read_encoded_window(
     first_chunk = start_byte // chunk_len
     last_chunk = (end_byte - 1) // chunk_len
     pieces = []
+    read_seconds = 0.0
+    decompress_seconds = 0.0
     for idx in range(first_chunk, last_chunk + 1):
-        chunk = read_chunk(chunk_dir, arch, chrom, component, idx, compressor, drop_page_cache)
+        chunk, chunk_read_seconds, chunk_decompress_seconds = read_chunk(
+            chunk_dir, arch, chrom, component, idx, compressor, drop_page_cache
+        )
+        read_seconds += chunk_read_seconds
+        decompress_seconds += chunk_decompress_seconds
         chunk_start = idx * chunk_len
         local_start = max(0, start_byte - chunk_start)
         local_end = min(len(chunk), end_byte - chunk_start)
         pieces.append(chunk[local_start:local_end])
-    return b"".join(pieces)
+    return b"".join(pieces), read_seconds, decompress_seconds
 
 
 def read_window(store, arch, chunk_bases, compressor, request, drop_page_cache):
@@ -392,7 +403,7 @@ def read_window(store, arch, chunk_bases, compressor, request, drop_page_cache):
     end = request.start + request.bases
 
     if arch == "uint8":
-        read_encoded_window(
+        return read_encoded_window(
             chunk_dir,
             arch,
             request.chrom,
@@ -405,7 +416,7 @@ def read_window(store, arch, chunk_bases, compressor, request, drop_page_cache):
     elif arch == "4bit":
         byte_start = start // 2
         byte_end = int(math.ceil(end / 2.0))
-        read_encoded_window(
+        return read_encoded_window(
             chunk_dir,
             arch,
             request.chrom,
@@ -420,7 +431,7 @@ def read_window(store, arch, chunk_bases, compressor, request, drop_page_cache):
         seq_end = int(math.ceil(end / 4.0))
         flag_start = start // 8
         flag_end = int(math.ceil(end / 8.0))
-        read_encoded_window(
+        seq_result, seq_read_seconds, seq_decompress_seconds = read_encoded_window(
             chunk_dir,
             arch,
             request.chrom,
@@ -431,7 +442,7 @@ def read_window(store, arch, chunk_bases, compressor, request, drop_page_cache):
             drop_page_cache,
             "seq",
         )
-        read_encoded_window(
+        flag_result, flag_read_seconds, flag_decompress_seconds = read_encoded_window(
             chunk_dir,
             arch,
             request.chrom,
@@ -441,6 +452,11 @@ def read_window(store, arch, chunk_bases, compressor, request, drop_page_cache):
             compressor,
             drop_page_cache,
             "flag",
+        )
+        return (
+            seq_result + flag_result,
+            seq_read_seconds + flag_read_seconds,
+            seq_decompress_seconds + flag_decompress_seconds,
         )
     else:
         raise ValueError("Unsupported architecture: {}".format(arch))
@@ -458,22 +474,32 @@ def benchmark_store(path, arch, chunk_bases, compressor_name, requests, warmup, 
         read_window(path, arch, chunk_bases, compressor, request, drop_page_cache)
 
     latencies = []
+    read_latencies = []
+    decompress_latencies = []
     total_bases = 0
     wall_start = time.perf_counter()
     for request in requests:
         req_start = time.perf_counter()
-        read_window(path, arch, chunk_bases, compressor, request, drop_page_cache)
+        _, read_seconds, decompress_seconds = read_window(
+            path, arch, chunk_bases, compressor, request, drop_page_cache
+        )
         latencies.append(time.perf_counter() - req_start)
+        read_latencies.append(read_seconds)
+        decompress_latencies.append(decompress_seconds)
         total_bases += request.bases
 
     wall_seconds = time.perf_counter() - wall_start
     lat_ms = [value * 1000 for value in latencies]
+    read_ms = [value * 1000 for value in read_latencies]
+    decompress_ms = [value * 1000 for value in decompress_latencies]
     return {
         "throughput_mib_s": (total_bases / float(BASES_PER_MIB)) / wall_seconds,
         "avg_latency_ms": statistics.mean(lat_ms),
         "median_latency_ms": statistics.median(lat_ms),
         "p95_latency_ms": percentile(lat_ms, 95),
         "p99_latency_ms": percentile(lat_ms, 99),
+        "avg_read_latency_ms": statistics.mean(read_ms),
+        "avg_decompress_latency_ms": statistics.mean(decompress_ms),
         "wall_seconds": wall_seconds,
     }
 
@@ -505,8 +531,10 @@ def write_csv(path, rows):
 def generate_plots(results_csv, output_dir):
     try:
         import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
         import pandas as pd
         import seaborn as sns
+        import numpy as np
     except ImportError:
         print("Skipping plots because pandas/matplotlib/seaborn are not installed.", flush=True)
         return
@@ -524,13 +552,15 @@ def generate_plots(results_csv, output_dir):
 
     sns.set_theme(style="whitegrid")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    metrics = [
+    # ---------------------------------------------------------
+    # 1. Standard Seaborn Plots (Throughput & Storage)
+    # ---------------------------------------------------------
+    standard_metrics = [
         ("throughput_mib_s", "compression_throughput", "Throughput (MiB logical bases/s)"),
-        ("p99_latency_ms", "compression_p99_latency", "p99 latency (ms)"),
         ("physical_size_gib", "compression_physical_storage", "Physical size (GiB)"),
     ]
 
-    for metric, filename, ylabel in metrics:
+    for metric, filename, ylabel in standard_metrics:
         grid = sns.catplot(
             data=df,
             kind="bar",
@@ -548,7 +578,8 @@ def generate_plots(results_csv, output_dir):
         )
         grid.set_axis_labels("Logical chunk size", ylabel)
         grid.set_titles("Chunk: {col_name}")
-        grid.legend.set_title("Compressor")
+        if grid.legend is not None:
+            grid.legend.set_title("Compressor")
         for axis in grid.axes.flat:
             axis.tick_params(axis="x", rotation=35)
         grid.figure.tight_layout()
@@ -557,6 +588,79 @@ def generate_plots(results_csv, output_dir):
         plt.close(grid.figure)
         print("Saved plot: {}".format(out), flush=True)
 
+    # ---------------------------------------------------------
+    # 2. Custom Grouped & Stacked Plot (Read vs Decompress Latency)
+    # ---------------------------------------------------------
+    chunk_names = df['chunk_name'].unique()
+    architectures = df['architecture'].unique()
+
+    cols = 3
+    rows = int(np.ceil(len(chunk_names) / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 5, rows * 4), squeeze=False)
+    axes = axes.flatten()
+
+    palette = sns.color_palette("tab10", len(hue_order))
+    bar_width = 0.8 / len(hue_order)
+
+    for i, chunk in enumerate(chunk_names):
+        ax = axes[i]
+        chunk_df = df[df['chunk_name'] == chunk]
+        x_positions = np.arange(len(architectures))
+
+        for j, comp in enumerate(hue_order):
+            comp_df = chunk_df[chunk_df['compressor'] == comp]
+
+            read_vals = []
+            decomp_vals = []
+
+            for arch in architectures:
+                row = comp_df[comp_df['architecture'] == arch]
+                if not row.empty:
+                    read_vals.append(row['avg_read_latency_ms'].values[0])
+                    decomp_vals.append(row['avg_decompress_latency_ms'].values[0])
+                else:
+                    read_vals.append(0)
+                    decomp_vals.append(0)
+
+            # Shift X position to dodge the groups
+            pos = x_positions - 0.4 + (j * bar_width) + (bar_width / 2)
+
+            # Plot bottom bar (Read Latency)
+            ax.bar(pos, read_vals, bar_width, color=palette[j], edgecolor='white')
+
+            # Plot stacked top bar (Decompression Latency)
+            ax.bar(pos, decomp_vals, bar_width, bottom=read_vals, color=palette[j],
+                   alpha=0.5, hatch='//', edgecolor='white')
+
+        ax.set_title("Chunk: {}".format(chunk))
+        ax.set_xticks(x_positions)
+        ax.set_xticklabels(architectures, rotation=35)
+        ax.set_ylabel("Latency (ms)")
+
+    # Hide any unused subplots in the grid
+    for i in range(len(chunk_names), len(axes)):
+        fig.delaxes(axes[i])
+
+    # Create a custom combined legend
+    comp_patches = [mpatches.Patch(color=palette[i], label=c) for i, c in enumerate(hue_order)]
+    legend_spacer = [mpatches.Patch(color='none', label='')]
+    phase_patches = [
+        mpatches.Patch(facecolor='gray', edgecolor='white', label='Disk Read Time'),
+        mpatches.Patch(facecolor='gray', alpha=0.5, hatch='//', edgecolor='white', label='CPU Decomp Time')
+    ]
+
+    fig.legend(
+        handles=comp_patches + legend_spacer + phase_patches,
+        loc='center left',
+        bbox_to_anchor=(1.0, 0.5),
+        title="Legend"
+    )
+
+    fig.tight_layout()
+    out_latency = output_dir / "compression_stacked_latency_{}.png".format(timestamp)
+    fig.savefig(str(out_latency), dpi=250, bbox_inches="tight")
+    plt.close(fig)
+    print("Saved plot: {}".format(out_latency), flush=True)
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -669,12 +773,14 @@ def main():
                     results.append(row)
                     print(
                         "{:9} | {:>5} | {:<5} | {:9.2f} MiB/s | avg {:8.3f} ms | "
-                        "p99 {:8.3f} ms | physical {:.3f} GiB".format(
+                        "read {:8.3f} ms | decomp {:8.3f} ms | p99 {:8.3f} ms | physical {:.3f} GiB".format(
                             arch,
                             chunk_name,
                             compressor_name,
                             metrics["throughput_mib_s"],
                             metrics["avg_latency_ms"],
+                            metrics["avg_read_latency_ms"],
+                            metrics["avg_decompress_latency_ms"],
                             metrics["p99_latency_ms"],
                             row["physical_size_gib"],
                         )
