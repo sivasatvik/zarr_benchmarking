@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=benchmark_data_generator
+#SBATCH --job-name=zarr_benchmark
 #SBATCH --mail-type=END,FAIL      # Mail events (NONE, BEGIN, END, FAIL, ALL)
 #SBATCH --mail-user=sm12779@nyulangone.org
 #SBATCH --partition=cpu_short

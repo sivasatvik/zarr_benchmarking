@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=benchmark_data_generator
+#SBATCH --job-name=zarr_compression_build
 #SBATCH --mail-type=END,FAIL      # Mail events (NONE, BEGIN, END, FAIL, ALL)
 #SBATCH --mail-user=sm12779@nyulangone.org
 #SBATCH --partition=cpu_short
@@ -15,4 +15,4 @@
 source /gpfs/data/jt3545lab/home/sm12779/miniconda3/etc/profile.d/conda.sh
 conda activate /gpfs/data/jt3545lab/home/sm12779/conda/env/test_env
 
-python zarr_compression_benchmark.py --fasta hg38_data/hg38.fa --output-dir zarr_compression_benchmark --build-only --chromosomes all
+python zarr_compression_benchmark.py --fasta hg38_data/hg38.fa --output-dir zarr_compression_benchmark --build-only --chromosomes all --backends zarr

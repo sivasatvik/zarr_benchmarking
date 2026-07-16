@@ -54,8 +54,9 @@ DEFAULT_CHUNK_SIZES = {
     "4MB": 4_194_304,
     "16MB": 16_777_216,
 }
+DEFAULT_BACKENDS = ("manual", "zarr")
 DEFAULT_ARCHITECTURES = ("uint8", "4bit", "2bit_flag")
-DEFAULT_COMPRESSORS = ("none", "zlib", "gzip", "lz4", "zstd") #"bz2", "lzma", )
+DEFAULT_COMPRESSORS = ("none", "lz4", "zstd") #"bz2", "lzma", )
 BASES_PER_MIB = 1024 * 1024
 
 
@@ -144,6 +145,22 @@ def validate_compressor(name):
             raise SystemExit("Compressor 'zstd' needs: pip install zstandard")
         return
     raise SystemExit("Unknown compressor: {}".format(name))
+
+
+def validate_backend(name):
+    if name == "manual":
+        return
+    if name == "zarr":
+        try:
+            import zarr  # noqa: F401
+        except ImportError:
+            raise SystemExit("Backend 'zarr' needs: pip install zarr numcodecs")
+        try:
+            import numcodecs  # noqa: F401
+        except ImportError:
+            raise SystemExit("Backend 'zarr' needs: pip install numcodecs")
+        return
+    raise SystemExit("Unknown backend: {}".format(name))
 
 
 def fasta_index_path(fasta):
@@ -256,8 +273,10 @@ def encoded_length(arch, bases, component="data"):
     return bytes_for_bases(arch, bases, component)
 
 
-def store_path(root, arch, chunk_name, compressor_name):
-    return root / "stores" / arch / chunk_name / "{}.zarr".format(compressor_name)
+def store_path(root, backend, arch, chunk_name, compressor_name):
+    if backend == "manual":
+        return root / "stores" / arch / chunk_name / "{}.zarr".format(compressor_name)
+    return root / "stores" / backend / arch / chunk_name / "{}.zarr".format(compressor_name)
 
 
 def write_zarr_metadata(store, arch, chunk_name, chunk_bases, compressor_name, chromosomes):
@@ -277,6 +296,25 @@ def write_zarr_metadata(store, arch, chunk_name, chunk_bases, compressor_name, c
         json.dump(meta, handle, indent=2)
 
 
+def write_zarr_package_metadata(store, arch, chunk_name, chunk_bases, compressor_name, chromosomes):
+    meta = {
+        "backend": "zarr",
+        "architecture": arch,
+        "chunk_name": chunk_name,
+        "logical_chunk_bases": chunk_bases,
+        "compressor": compressor_name,
+        "chromosomes": [{"name": c.name, "length": c.length} for c in chromosomes],
+    }
+    try:
+        import zarr
+
+        group = zarr.open_group(str(store), mode="w")
+        group.attrs.update(meta)
+    except Exception:
+        with (store / "zarr.json").open("w") as handle:
+            json.dump({"zarr_format": 2, "node_type": "group", "attributes": meta}, handle, indent=2)
+
+
 def chunk_file_name(arch, chrom, component, index):
     if arch == "2bit_flag":
         return "{}_{}_{}".format(chrom, component, index)
@@ -293,7 +331,32 @@ def write_compressed_chunks(chunk_dir, arch, chrom, payload, chunk_len, compress
             handle.write(compressor.compress(chunk))
 
 
-def build_store(fasta, out_store, arch, chunk_name, chunk_bases, compressor_name, chromosomes, force):
+def zarr_compressor(name):
+    if name == "none":
+        return None
+    try:
+        import numcodecs
+    except ImportError:
+        raise SystemExit("Backend 'zarr' needs: pip install numcodecs")
+
+    compressors = {
+        "zlib": lambda: numcodecs.Zlib(level=6),
+        "gzip": lambda: numcodecs.GZip(level=6),
+        "bz2": lambda: numcodecs.BZ2(level=6),
+        "lzma": lambda: numcodecs.LZMA(preset=6),
+        "lz4": lambda: numcodecs.LZ4(acceleration=1),
+        "zstd": lambda: numcodecs.Zstd(level=3),
+    }
+    if name not in compressors:
+        raise SystemExit("Unknown compressor for zarr backend: {}".format(name))
+    return compressors[name]()
+
+
+def backend_uses_breakdown(name):
+    return name == "manual"
+
+
+def build_manual_store(fasta, out_store, arch, chunk_name, chunk_bases, compressor_name, chromosomes, force):
     done_marker = out_store / ".benchmark_complete.json"
     if done_marker.exists() and not force:
         return 0.0
@@ -332,6 +395,99 @@ def build_store(fasta, out_store, arch, chunk_name, chunk_bases, compressor_name
     with done_marker.open("w") as handle:
         json.dump({"build_seconds": build_seconds}, handle, indent=2)
     return build_seconds
+
+
+def build_zarr_store(fasta, out_store, arch, chunk_name, chunk_bases, compressor_name, chromosomes, force):
+    done_marker = out_store / ".benchmark_complete.json"
+    if done_marker.exists() and not force:
+        return 0.0
+
+    if out_store.exists():
+        shutil.rmtree(str(out_store))
+    out_store.mkdir(parents=True, exist_ok=True)
+    write_zarr_package_metadata(out_store, arch, chunk_name, chunk_bases, compressor_name, chromosomes)
+
+    try:
+        import zarr
+    except ImportError:
+        raise SystemExit("Backend 'zarr' needs: pip install zarr")
+
+    group = zarr.open_group(str(out_store), mode="a")
+    group.attrs.update(
+        {
+            "backend": "zarr",
+            "architecture": arch,
+            "chunk_name": chunk_name,
+            "logical_chunk_bases": chunk_bases,
+            "compressor": compressor_name,
+            "chromosomes": [{"name": c.name, "length": c.length} for c in chromosomes],
+        }
+    )
+
+    compressor = zarr_compressor(compressor_name)
+    wanted = set(chrom.name for chrom in chromosomes)
+    start_time = time.perf_counter()
+
+    for chrom, seq in iter_fasta_records(fasta, wanted):
+        if arch == "uint8":
+            data = np.frombuffer(encode_uint8(seq), dtype=np.uint8)
+            array = group.create_dataset(
+                chrom,
+                shape=data.shape,
+                chunks=(bytes_for_bases(arch, chunk_bases),),
+                dtype=np.uint8,
+                compressor=compressor,
+                overwrite=True,
+            )
+            array[:] = data
+        elif arch == "4bit":
+            data = np.frombuffer(encode_4bit(seq), dtype=np.uint8)
+            array = group.create_dataset(
+                chrom,
+                shape=data.shape,
+                chunks=(bytes_for_bases(arch, chunk_bases),),
+                dtype=np.uint8,
+                compressor=compressor,
+                overwrite=True,
+            )
+            array[:] = data
+        elif arch == "2bit_flag":
+            seq_bytes, flag_bytes = encode_2bit_flag(seq)
+            seq_data = np.frombuffer(seq_bytes, dtype=np.uint8)
+            flag_data = np.frombuffer(flag_bytes, dtype=np.uint8)
+            seq_array = group.create_dataset(
+                "{}_seq".format(chrom),
+                shape=seq_data.shape,
+                chunks=(bytes_for_bases(arch, chunk_bases, "seq"),),
+                dtype=np.uint8,
+                compressor=compressor,
+                overwrite=True,
+            )
+            flag_array = group.create_dataset(
+                "{}_flag".format(chrom),
+                shape=flag_data.shape,
+                chunks=(bytes_for_bases(arch, chunk_bases, "flag"),),
+                dtype=np.uint8,
+                compressor=compressor,
+                overwrite=True,
+            )
+            seq_array[:] = seq_data
+            flag_array[:] = flag_data
+        else:
+            raise ValueError("Unsupported architecture: {}".format(arch))
+
+    build_seconds = time.perf_counter() - start_time
+    with done_marker.open("w") as handle:
+        json.dump({"build_seconds": build_seconds}, handle, indent=2)
+    return build_seconds
+
+
+def build_store(fasta, out_store, backend, arch, chunk_name, chunk_bases, compressor_name, chromosomes, force):
+    if backend == "manual":
+        return build_manual_store(fasta, out_store, arch, chunk_name, chunk_bases, compressor_name, chromosomes, force)
+    if backend == "zarr":
+        return build_zarr_store(fasta, out_store, arch, chunk_name, chunk_bases, compressor_name, chromosomes, force)
+    raise ValueError("Unsupported backend: {}".format(backend))
 
 
 def generate_requests(chromosomes, num_requests, window_bases, seed):
@@ -462,16 +618,91 @@ def read_window(store, arch, chunk_bases, compressor, request, drop_page_cache):
         raise ValueError("Unsupported architecture: {}".format(arch))
 
 
+def read_manual_window(store, arch, chunk_bases, compressor, request, drop_page_cache):
+    return read_window(store, arch, chunk_bases, compressor, request, drop_page_cache)
+
+
+def read_zarr_chunk_files(store, array_name, start_byte, end_byte, chunk_len, drop_page_cache):
+    if not drop_page_cache or not hasattr(os, "posix_fadvise") or not hasattr(os, "POSIX_FADV_DONTNEED"):
+        return
+    first_chunk = start_byte // chunk_len
+    last_chunk = (end_byte - 1) // chunk_len
+    for idx in range(first_chunk, last_chunk + 1):
+        path = store / array_name / str(idx)
+        try:
+            with path.open("rb") as handle:
+                os.posix_fadvise(handle.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+        except OSError:
+            pass
+
+
+def read_zarr_window_from_group(group, store, arch, chunk_bases, request, drop_page_cache):
+    start = request.start
+    end = request.start + request.bases
+
+    read_start = time.perf_counter()
+    if arch == "uint8":
+        data = group[request.chrom][start:end]
+        read_seconds = time.perf_counter() - read_start
+        read_zarr_chunk_files(store, request.chrom, start, end, bytes_for_bases(arch, chunk_bases), drop_page_cache)
+        return np.asarray(data, dtype=np.uint8).tobytes(), read_seconds, 0.0
+    if arch == "4bit":
+        byte_start = start // 2
+        byte_end = int(math.ceil(end / 2.0))
+        data = group[request.chrom][byte_start:byte_end]
+        read_seconds = time.perf_counter() - read_start
+        read_zarr_chunk_files(store, request.chrom, byte_start, byte_end, bytes_for_bases(arch, chunk_bases), drop_page_cache)
+        return np.asarray(data, dtype=np.uint8).tobytes(), read_seconds, 0.0
+    if arch == "2bit_flag":
+        seq_start = start // 4
+        seq_end = int(math.ceil(end / 4.0))
+        flag_start = start // 8
+        flag_end = int(math.ceil(end / 8.0))
+        seq_data = group["{}_seq".format(request.chrom)][seq_start:seq_end]
+        flag_data = group["{}_flag".format(request.chrom)][flag_start:flag_end]
+        read_seconds = time.perf_counter() - read_start
+        read_zarr_chunk_files(store, "{}_seq".format(request.chrom), seq_start, seq_end, bytes_for_bases(arch, chunk_bases, "seq"), drop_page_cache)
+        read_zarr_chunk_files(store, "{}_flag".format(request.chrom), flag_start, flag_end, bytes_for_bases(arch, chunk_bases, "flag"), drop_page_cache)
+        return (
+            np.asarray(seq_data, dtype=np.uint8).tobytes() + np.asarray(flag_data, dtype=np.uint8).tobytes(),
+            read_seconds,
+            0.0,
+        )
+    raise ValueError("Unsupported architecture: {}".format(arch))
+
+
+def read_zarr_window(store, arch, chunk_bases, request, drop_page_cache):
+    try:
+        import zarr
+    except ImportError:
+        raise SystemExit("Backend 'zarr' needs: pip install zarr")
+
+    group = zarr.open_group(str(store), mode="r")
+    return read_zarr_window_from_group(group, store, arch, chunk_bases, request, drop_page_cache)
+
+
 def percentile(values, pct):
     if not values:
         return float("nan")
     return float(np.percentile(np.array(values), pct))
 
 
-def benchmark_store(path, arch, chunk_bases, compressor_name, requests, warmup, drop_page_cache):
+def benchmark_store(path, backend, arch, chunk_bases, compressor_name, requests, warmup, drop_page_cache):
     compressor = Compressor(compressor_name)
+    zarr_group = None
+    if backend == "zarr":
+        try:
+            import zarr
+        except ImportError:
+            raise SystemExit("Backend 'zarr' needs: pip install zarr")
+        zarr_group = zarr.open_group(str(path), mode="r")
     for request in requests[:warmup]:
-        read_window(path, arch, chunk_bases, compressor, request, drop_page_cache)
+        if backend == "manual":
+            read_manual_window(path, arch, chunk_bases, compressor, request, drop_page_cache)
+        elif backend == "zarr":
+            read_zarr_window_from_group(zarr_group, path, arch, chunk_bases, request, drop_page_cache)
+        else:
+            raise ValueError("Unsupported backend: {}".format(backend))
 
     latencies = []
     read_latencies = []
@@ -480,9 +711,16 @@ def benchmark_store(path, arch, chunk_bases, compressor_name, requests, warmup, 
     wall_start = time.perf_counter()
     for request in requests:
         req_start = time.perf_counter()
-        _, read_seconds, decompress_seconds = read_window(
-            path, arch, chunk_bases, compressor, request, drop_page_cache
-        )
+        if backend == "manual":
+            _, read_seconds, decompress_seconds = read_manual_window(
+                path, arch, chunk_bases, compressor, request, drop_page_cache
+            )
+        elif backend == "zarr":
+            _, read_seconds, decompress_seconds = read_zarr_window_from_group(
+                zarr_group, path, arch, chunk_bases, request, drop_page_cache
+            )
+        else:
+            raise ValueError("Unsupported backend: {}".format(backend))
         latencies.append(time.perf_counter() - req_start)
         read_latencies.append(read_seconds)
         decompress_latencies.append(decompress_seconds)
@@ -544,11 +782,21 @@ def generate_plots(results_csv, output_dir):
         return
 
     df = df.copy()
-    hue_order = [
-        compressor
-        for compressor in DEFAULT_COMPRESSORS
-        if not df[df["compressor"] == compressor].empty
-    ]
+    if "run_label" in df.columns:
+        hue_order = [
+            "{}:{}".format(backend, compressor)
+            for backend in DEFAULT_BACKENDS
+            for compressor in DEFAULT_COMPRESSORS
+            if not df[df["run_label"] == "{}:{}".format(backend, compressor)].empty
+        ]
+        hue_column = "run_label"
+    else:
+        hue_order = [
+            compressor
+            for compressor in DEFAULT_COMPRESSORS
+            if not df[df["compressor"] == compressor].empty
+        ]
+        hue_column = "compressor"
 
     sns.set_theme(style="whitegrid")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -557,6 +805,7 @@ def generate_plots(results_csv, output_dir):
     # ---------------------------------------------------------
     standard_metrics = [
         ("throughput_mib_s", "compression_throughput", "Throughput (MiB logical bases/s)"),
+        ("avg_latency_ms", "compression_latency", "Average latency (ms)"),
         ("physical_size_gib", "compression_physical_storage", "Physical size (GiB)"),
     ]
 
@@ -566,7 +815,7 @@ def generate_plots(results_csv, output_dir):
             kind="bar",
             x="architecture",
             y=metric,
-            hue="compressor",
+            hue=hue_column,
             hue_order=hue_order,
             col="chunk_name",
             col_wrap=3,
@@ -591,6 +840,12 @@ def generate_plots(results_csv, output_dir):
     # ---------------------------------------------------------
     # 2. Custom Grouped & Stacked Plot (Read vs Decompress Latency)
     # ---------------------------------------------------------
+    if "avg_read_latency_ms" not in df.columns or "avg_decompress_latency_ms" not in df.columns:
+        return
+    if df["avg_read_latency_ms"].isna().any() or df["avg_decompress_latency_ms"].isna().any():
+        print("Skipping stacked read/decompress plot for mixed backends.", flush=True)
+        return
+
     chunk_names = df['chunk_name'].unique()
     architectures = df['architecture'].unique()
 
@@ -608,7 +863,7 @@ def generate_plots(results_csv, output_dir):
         x_positions = np.arange(len(architectures))
 
         for j, comp in enumerate(hue_order):
-            comp_df = chunk_df[chunk_df['compressor'] == comp]
+            comp_df = chunk_df[chunk_df[hue_column] == comp]
 
             read_vals = []
             decomp_vals = []
@@ -673,6 +928,7 @@ def parse_args():
         default=Path("./hg38_benchmark_data/compressed_zarr_benchmark"),
     )
     parser.add_argument("--chromosomes", nargs="+", default=["chr1"], help="Use names such as chr1 chr2, or all.")
+    parser.add_argument("--backends", nargs="+", default=["manual"], choices=DEFAULT_BACKENDS, help="Choose one or both of: manual zarr.")
     parser.add_argument("--architectures", nargs="+", default=list(DEFAULT_ARCHITECTURES), choices=DEFAULT_ARCHITECTURES)
     parser.add_argument("--chunk-sizes", nargs="+", default=list(DEFAULT_CHUNK_SIZES), help="Logical base chunk sizes.")
     parser.add_argument("--compressors", nargs="+", default=list(DEFAULT_COMPRESSORS), help="none zlib gzip bz2 lzma lz4 zstd")
@@ -706,6 +962,8 @@ def main():
         )
 
     chunk_sizes = [parse_size(label) for label in args.chunk_sizes]
+    for backend_name in args.backends:
+        validate_backend(backend_name)
     for compressor_name in args.compressors:
         validate_compressor(compressor_name)
 
@@ -718,73 +976,104 @@ def main():
     print("Compressed Zarr-style chunk benchmark", flush=True)
     print("FASTA: {}".format(args.fasta), flush=True)
     print("Chromosomes: {}".format(", ".join(chrom.name for chrom in chromosomes)), flush=True)
+    print("Backends: {}".format(", ".join(args.backends)), flush=True)
     print("Output: {}".format(args.output_dir), flush=True)
     print("=" * 100, flush=True)
 
-    for arch in args.architectures:
-        for chunk_name, chunk_bases in chunk_sizes:
-            for compressor_name in args.compressors:
-                path = store_path(args.output_dir, arch, chunk_name, compressor_name)
-                build_seconds = 0.0
+    for backend in args.backends:
+        for arch in args.architectures:
+            for chunk_name, chunk_bases in chunk_sizes:
+                for compressor_name in args.compressors:
+                    path = store_path(args.output_dir, backend, arch, chunk_name, compressor_name)
+                    build_seconds = 0.0
 
-                if not args.benchmark_only:
-                    print("Building {:9} chunk={:>5} compressor={:<5}".format(arch, chunk_name, compressor_name), flush=True)
-                    build_seconds = build_store(
-                        args.fasta,
-                        path,
-                        arch,
-                        chunk_name,
-                        chunk_bases,
-                        compressor_name,
-                        chromosomes,
-                        args.force_rebuild,
-                    )
-
-                apparent, physical, file_count = storage_bytes(path) if path.exists() else (0, 0, 0)
-                if args.build_only:
-                    continue
-                if not path.exists():
-                    raise SystemExit("Store missing for --benchmark-only: {}".format(path))
-
-                for iteration in range(args.iterations):
-                    metrics = benchmark_store(
-                        path,
-                        arch,
-                        chunk_bases,
-                        compressor_name,
-                        requests,
-                        args.warmup,
-                        not args.keep_page_cache,
-                    )
-                    row = {
-                        "architecture": arch,
-                        "chunk_name": chunk_name,
-                        "logical_chunk_bases": chunk_bases,
-                        "compressor": compressor_name,
-                        "iteration": iteration + 1,
-                        "num_requests": args.num_requests,
-                        "window_bases": args.window_bases,
-                        "build_seconds": round(build_seconds, 6),
-                        "apparent_size_gib": apparent / float(1024**3),
-                        "physical_size_gib": physical / float(1024**3),
-                        "file_count": file_count,
-                    }
-                    row.update(metrics)
-                    results.append(row)
-                    print(
-                        "{:9} | {:>5} | {:<5} | {:9.2f} MiB/s | avg {:8.3f} ms | "
-                        "read {:8.3f} ms | decomp {:8.3f} ms | p99 {:8.3f} ms | physical {:.3f} GiB".format(
+                    if not args.benchmark_only:
+                        print(
+                            "Building {:7} {:9} chunk={:>5} compressor={:<5}".format(
+                                backend, arch, chunk_name, compressor_name
+                            ),
+                            flush=True,
+                        )
+                        build_seconds = build_store(
+                            args.fasta,
+                            path,
+                            backend,
                             arch,
                             chunk_name,
+                            chunk_bases,
                             compressor_name,
-                            metrics["throughput_mib_s"],
-                            metrics["avg_latency_ms"],
-                            metrics["avg_read_latency_ms"],
-                            metrics["avg_decompress_latency_ms"],
-                            metrics["p99_latency_ms"],
-                            row["physical_size_gib"],
+                            chromosomes,
+                            args.force_rebuild,
                         )
-                    , flush=True)
+
+                    apparent, physical, file_count = storage_bytes(path) if path.exists() else (0, 0, 0)
+                    if args.build_only:
+                        continue
+                    if not path.exists():
+                        raise SystemExit("Store missing for --benchmark-only: {}".format(path))
+
+                    for iteration in range(args.iterations):
+                        metrics = benchmark_store(
+                            path,
+                            backend,
+                            arch,
+                            chunk_bases,
+                            compressor_name,
+                            requests,
+                            args.warmup,
+                            not args.keep_page_cache,
+                        )
+                        row = {
+                            "backend": backend,
+                            "run_label": "{}:{}".format(backend, compressor_name),
+                            "architecture": arch,
+                            "chunk_name": chunk_name,
+                            "logical_chunk_bases": chunk_bases,
+                            "compressor": compressor_name,
+                            "iteration": iteration + 1,
+                            "num_requests": args.num_requests,
+                            "window_bases": args.window_bases,
+                            "build_seconds": round(build_seconds, 6),
+                            "apparent_size_gib": apparent / float(1024**3),
+                            "physical_size_gib": physical / float(1024**3),
+                            "file_count": file_count,
+                        }
+                        row.update(metrics)
+                        if not backend_uses_breakdown(backend):
+                            row["avg_read_latency_ms"] = math.nan
+                            row["avg_decompress_latency_ms"] = math.nan
+                        results.append(row)
+                        if backend_uses_breakdown(backend):
+                            print(
+                                "{:7} | {:9} | {:>5} | {:<5} | {:9.2f} MiB/s | avg {:8.3f} ms | "
+                                "read {:8.3f} ms | decomp {:8.3f} ms | p99 {:8.3f} ms | physical {:.3f} GiB".format(
+                                    backend,
+                                    arch,
+                                    chunk_name,
+                                    compressor_name,
+                                    metrics["throughput_mib_s"],
+                                    metrics["avg_latency_ms"],
+                                    metrics["avg_read_latency_ms"],
+                                    metrics["avg_decompress_latency_ms"],
+                                    metrics["p99_latency_ms"],
+                                    row["physical_size_gib"],
+                                ),
+                                flush=True,
+                            )
+                        else:
+                            print(
+                                "{:7} | {:9} | {:>5} | {:<5} | {:9.2f} MiB/s | avg {:8.3f} ms | p99 {:8.3f} ms | physical {:.3f} GiB".format(
+                                    backend,
+                                    arch,
+                                    chunk_name,
+                                    compressor_name,
+                                    metrics["throughput_mib_s"],
+                                    metrics["avg_latency_ms"],
+                                    metrics["p99_latency_ms"],
+                                    row["physical_size_gib"],
+                                ),
+                                flush=True,
+                            )
 
     if results:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
