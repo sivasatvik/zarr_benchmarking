@@ -4,6 +4,7 @@ import random
 import bisect
 import argparse
 from typing import Any
+from pathlib import Path
 import torch
 import numcodecs
 import numpy as np
@@ -46,15 +47,22 @@ class ZarrDataset(Dataset):
         self.chrom = chrom
         self.window_size = window_size
         self.flag = False
-        self.arch = "uint8"  # Zarr store is assumed to be uint8 for this benchmark
-        if "4bit" in store_path.lower():
-            self.arch = "4bit"
-        elif "2bit" in store_path.lower():
-            self.arch = "2bit"
         
         # Open once briefly just to get the total length
         import zarr
         store = zarr.open(self.store_path, mode='r')
+
+        if hasattr(store, "attrs"):
+            store_attrs = dict(store.attrs)
+        else:
+            store_attrs = {}
+
+        path_parts = Path(self.store_path).parts
+        self.arch = store_attrs.get("architecture", path_parts[-3] if len(path_parts) >= 3 else "uint8")
+        self.compressor = store_attrs.get("compressor", Path(self.store_path).name.replace(".zarr", ""))
+        self.chunk_name = store_attrs.get("chunk_name", path_parts[-2] if len(path_parts) >= 2 else "1MB")
+
+        print(f"[*] ZarrDataset: Detected architecture: {self.arch}, Compressor: {self.compressor}, Chunk: {self.chunk_name}")
 
         if self.chrom is None:
             if hasattr(store, "shape"):
@@ -133,6 +141,8 @@ class FourBitDataset(Dataset):
     def __init__(self, chunk_dir, window_size=4096, compressor="none"):
         self.window_size = window_size
         self.chunk_dir = chunk_dir
+        self.chunk_name = Path(chunk_dir).parts[-3] if len(Path(chunk_dir).parts) >= 3 else "1MB"
+        self.arch = "4bit"
         self.compressor = compressor.lower()
         self.flag = False
         
@@ -236,6 +246,8 @@ class TwoBitFlagDataset(Dataset):
         """
         self.window_size = window_size
         self.chunk_dir = chunk_dir
+        self.arch = "2bit"
+        self.compressor = "none"
         
         all_files = os.listdir(chunk_dir)
         seq_files_raw = sorted([f for f in all_files if '_seq_' in f])
@@ -452,7 +464,7 @@ def build_dataset(args, window_size):
             chrom=args.chrom,
             window_size=window_size,
         )
-        label = f"ZarrDataset({args.chrom or 'first-key'})"
+        label = f"ZarrDataset [arch: {dataset.arch}, compressor: {dataset.compressor}, chunk: {dataset.chunk_name}]"
         detail = f"[*] Using Zarr store: {store_path}"
     elif dataset_type == "4bit":
         dataset = FourBitDataset(
@@ -460,11 +472,11 @@ def build_dataset(args, window_size):
             window_size=window_size,
             compressor=args.compressor,
         )
-        label = "4bitDataset"
+        label = f"4bitDataset [arch: {dataset.arch}, compressor: {dataset.compressor}, chunk: {dataset.chunk_name}]"
         detail = f"[*] Using 4-bit chunk directory: {args.dir_4bit}"
     else:
         dataset = TwoBitFlagDataset(args.dir_2bit, window_size=window_size)
-        label = "2bitDataset"
+        label = f"2bitDataset [arch: {dataset.arch}, compressor: {dataset.compressor}]"
         detail = f"[*] Using 2-bit chunk directory: {args.dir_2bit}"
 
     return dataset, label, detail
@@ -520,7 +532,7 @@ def main():
     # --- OUTPUTS ---
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     df = pd.DataFrame(results)
-    csv_filename = os.path.join(output_dir, f"dataloader_benchmark_results_{timestamp}.csv")
+    csv_filename = os.path.join(output_dir, f"{dataset_label}_benchmark_results_{timestamp}.csv")
     df.to_csv(csv_filename, index=False)
     print(f"Saved {csv_filename}")
     
@@ -539,9 +551,9 @@ def main():
     ax2.plot(df['Architecture'], df['Avg_Latency_ms'], color=color, marker='o', linestyle='dashed', linewidth=2, markersize=8)
     ax2.tick_params(axis='y', labelcolor=color)
     
-    plt.title('Dataloader Performance: Zarr vs 4-bit vs 2-bit (GPU Delivery)')
+    plt.title(f'Dataloader Performance Benchmark: {dataset_label}')
     fig.tight_layout()  
-    chart_filename = os.path.join(output_dir, f"dataloader_performance_chart_{timestamp}.png")
+    chart_filename = os.path.join(output_dir, f"{dataset_label}_dataloader_performance_chart_{timestamp}.png")
     plt.savefig(chart_filename, dpi=300)
     print(f"Saved {chart_filename}")
 
