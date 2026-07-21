@@ -138,13 +138,16 @@ class ZarrDataset(Dataset):
         return torch.from_numpy(window).long()
 
 class FourBitDataset(Dataset):
-    def __init__(self, chunk_dir, window_size=4096, compressor="none"):
+    def __init__(self, chunk_dir, window_size=4096, compressor="none", profile=False, profile_limit=5):
         self.window_size = window_size
         self.chunk_dir = chunk_dir
         self.chunk_name = Path(chunk_dir).parts[-3] if len(Path(chunk_dir).parts) >= 3 else "1MB"
         self.arch = "4bit"
         self.compressor = compressor.lower()
         self.flag = False
+        self.profile = profile
+        self.profile_limit = int(profile_limit)
+        self.profile_count = 0
         
         self.chunk_files = sorted([
             os.path.join(chunk_dir, f) for f in os.listdir(chunk_dir) 
@@ -156,8 +159,15 @@ class FourBitDataset(Dataset):
         self.max_elements_per_chunk = 0
         current_global_elements = 0
         
+        self.decompressor = None
         if self.compressor == "zstd":
-            self.decompressor = numcodecs.Zstd()
+            import zstandard
+
+            self.decompressor = zstandard.ZstdDecompressor()
+        elif self.compressor == "lz4":
+            import lz4.frame
+
+            self.decompressor = lz4.frame
 
         # 1. Build Index map using actual logical chunk sizes.
         for i, f in enumerate(self.chunk_files):
@@ -179,17 +189,28 @@ class FourBitDataset(Dataset):
 
         with open(chunk_file, "rb") as temp_f:
             compressed_bytes = temp_f.read()
-        return len(self.decompressor.decode(compressed_bytes))
+        if self.compressor == "zstd":
+            return len(self.decompressor.decompress(compressed_bytes))
+        if self.compressor == "lz4":
+            return len(self.decompressor.decompress(compressed_bytes))
+        raise ValueError(f"Unsupported compressor: {self.compressor}")
 
     def __len__(self):
         return self.total_windows
 
     def __getitem__(self, idx):
+        profile_active = self.profile and self.profile_count < self.profile_limit
+        profile_start = time.perf_counter() if profile_active else None
+
+        lookup_start = time.perf_counter() if profile_active else None
         chunk_idx = bisect.bisect_right(self.chunk_starts, idx) - 1
         local_idx = idx - self.chunk_starts[chunk_idx]
+        lookup_ms = (time.perf_counter() - lookup_start) * 1000 if profile_active else None
         
         elements_needed = self.window_size
         unpacked_arrays = []
+        io_ms = 0.0
+        unpack_ms = 0.0
         
         current_chunk_idx = chunk_idx
         current_local_idx = local_idx
@@ -205,17 +226,26 @@ class FourBitDataset(Dataset):
             end_byte = (current_local_idx + elements_to_take + 1) // 2 
             
             # --- COMPRESSION ROUTING ---
-            if self.compressor == "zstd":
+            io_start = time.perf_counter() if profile_active else None
+            if self.compressor != "none":
                 with open(chunk_file, 'rb') as f:
                     compressed_bytes = f.read()
-                raw_bytes = self.decompressor.decode(compressed_bytes)
+                if self.compressor == "zstd":
+                    raw_bytes = self.decompressor.decompress(compressed_bytes)
+                elif self.compressor == "lz4":
+                    raw_bytes = self.decompressor.decompress(compressed_bytes)
+                else:
+                    raise ValueError(f"Unsupported compressor: {self.compressor}")
                 target_bytes = raw_bytes[start_byte:end_byte]
             else:
                 with open(chunk_file, 'rb') as f:
                     f.seek(start_byte)
                     target_bytes = f.read(end_byte - start_byte)
             # ---------------------------
+            if profile_active:
+                io_ms += (time.perf_counter() - io_start) * 1000
                 
+            unpack_start = time.perf_counter() if profile_active else None
             packed = np.frombuffer(target_bytes, dtype=np.uint8)
             
             unpacked = np.empty(2 * len(packed), dtype=np.uint8)
@@ -225,16 +255,34 @@ class FourBitDataset(Dataset):
             byte_offset = current_local_idx % 2
             window_part = unpacked[byte_offset : byte_offset + elements_to_take]
             unpacked_arrays.append(window_part)
+            if profile_active:
+                unpack_ms += (time.perf_counter() - unpack_start) * 1000
             
             elements_needed -= elements_to_take
             current_chunk_idx += 1
             current_local_idx = 0 
             
+        concat_start = time.perf_counter() if profile_active else None
         final_window = np.concatenate(unpacked_arrays)
+        concat_ms = (time.perf_counter() - concat_start) * 1000 if profile_active else None
+        tensor_start = time.perf_counter() if profile_active else None
+        output = torch.from_numpy(final_window).long()
+        tensor_ms = (time.perf_counter() - tensor_start) * 1000 if profile_active else None
+
+        if profile_active:
+            total_ms = (time.perf_counter() - profile_start) * 1000
+            print(
+                "[*] FourBitDataset profile "
+                f"idx={idx} chunks={len(unpacked_arrays)} total={total_ms:.3f}ms "
+                f"lookup={lookup_ms:.3f}ms io+decompress={io_ms:.3f}ms "
+                f"unpack={unpack_ms:.3f}ms concat={concat_ms:.3f}ms tensor={tensor_ms:.3f}ms"
+            )
+            self.profile_count += 1
+
         if not self.flag:
             print(f"[*] FourBitDataset: Example window {idx}: {final_window}")
             self.flag = True
-        return torch.from_numpy(final_window).long()
+        return output
 
 
 class TwoBitFlagDataset(Dataset):
@@ -404,7 +452,7 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=128, help="Batch size")
     parser.add_argument("--num-workers", type=int, default=16, help="DataLoader worker count")
     parser.add_argument("--num-batches", type=int, default=5000, help="Number of batches to benchmark")
-    parser.add_argument("--compressor", type=str, default="none", help="Compressor to use (none, zstd)")
+    parser.add_argument("--compressor", type=str, default="none", help="Compressor to use (none, zstd, lz4)")
     parser.add_argument(
         "--dir-zarr",
         type=str,
@@ -428,6 +476,17 @@ def parse_args():
         type=str,
         default="dataloader_benchmark",
         help="Directory to write benchmark CSV and chart",
+    )
+    parser.add_argument(
+        "--profile-4bit",
+        action="store_true",
+        help="Print a timing breakdown for the first few 4-bit windows",
+    )
+    parser.add_argument(
+        "--profile-4bit-samples",
+        type=int,
+        default=5,
+        help="Number of 4-bit windows to profile when --profile-4bit is set",
     )
     parser.add_argument(
         "--store-path",
@@ -471,6 +530,8 @@ def build_dataset(args, window_size):
             args.dir_4bit,
             window_size=window_size,
             compressor=args.compressor,
+            profile=args.profile_4bit,
+            profile_limit=args.profile_4bit_samples,
         )
         label = f"4bitDataset [arch: {dataset.arch}, compressor: {dataset.compressor}, chunk: {dataset.chunk_name}]"
         detail = f"[*] Using 4-bit chunk directory: {args.dir_4bit}"
@@ -537,25 +598,25 @@ def main():
     print(f"Saved {csv_filename}")
     
     # Plotting
-    fig, ax1 = plt.subplots(figsize=(8, 5))
+    # fig, ax1 = plt.subplots(figsize=(8, 5))
     
-    color = 'tab:blue'
-    ax1.set_xlabel('Architecture')
-    ax1.set_ylabel('Batches per Second (Higher is Better)', color=color)
-    bars = ax1.bar(df['Architecture'], df['Batches_Per_Sec'], color=color, width=0.4)
-    ax1.tick_params(axis='y', labelcolor=color)
+    # color = 'tab:blue'
+    # ax1.set_xlabel('Architecture')
+    # ax1.set_ylabel('Batches per Second (Higher is Better)', color=color)
+    # bars = ax1.bar(df['Architecture'], df['Batches_Per_Sec'], color=color, width=0.4)
+    # ax1.tick_params(axis='y', labelcolor=color)
     
-    ax2 = ax1.twinx()  
-    color = 'tab:red'
-    ax2.set_ylabel('Avg Latency ms (Lower is Better)', color=color)  
-    ax2.plot(df['Architecture'], df['Avg_Latency_ms'], color=color, marker='o', linestyle='dashed', linewidth=2, markersize=8)
-    ax2.tick_params(axis='y', labelcolor=color)
+    # ax2 = ax1.twinx()  
+    # color = 'tab:red'
+    # ax2.set_ylabel('Avg Latency ms (Lower is Better)', color=color)  
+    # ax2.plot(df['Architecture'], df['Avg_Latency_ms'], color=color, marker='o', linestyle='dashed', linewidth=2, markersize=8)
+    # ax2.tick_params(axis='y', labelcolor=color)
     
-    plt.title(f'Dataloader Performance Benchmark: {dataset_label}')
-    fig.tight_layout()  
-    chart_filename = os.path.join(output_dir, f"{dataset_label}_dataloader_performance_chart_{timestamp}.png")
-    plt.savefig(chart_filename, dpi=300)
-    print(f"Saved {chart_filename}")
+    # plt.title(f'Dataloader Performance Benchmark: {dataset_label}')
+    # fig.tight_layout()  
+    # chart_filename = os.path.join(output_dir, f"{dataset_label}_dataloader_performance_chart_{timestamp}.png")
+    # plt.savefig(chart_filename, dpi=300)
+    # print(f"Saved {chart_filename}")
 
 if __name__ == "__main__":
     main()

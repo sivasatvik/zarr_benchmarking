@@ -25,6 +25,10 @@ python dataloader_benchmark.py --dir-4bit ./zarr_compression_benchmark/stores/4b
 
 python dataloader_benchmark.py --dataset-type zarr --dir-zarr ./zarr_compression_benchmark/stores/zarr/4bit/1MB/zstd.zarr --chrom chr1
 
+python dataloader_benchmark.py --dir-4bit ./zarr_compression_benchmark/stores/4bit/1MB/lz4.zarr/c/ --compressor lz4 --chrom chr1 --dataset-type 4bit
+
+python dataloader_benchmark.py --dataset-type zarr --dir-zarr ./zarr_compression_benchmark/stores/zarr/4bit/1MB/lz4.zarr --chrom chr1
+
 python dataloader_benchmark.py --dir-4bit ./zarr_compression_benchmark/stores/4bit/1MB/none.zarr/c/ --compressor none --chrom chr1 --dataset-type 4bit
 
 python dataloader_benchmark.py --dataset-type zarr --dir-zarr ./zarr_compression_benchmark/stores/zarr/4bit/1MB/none.zarr --chrom chr1
