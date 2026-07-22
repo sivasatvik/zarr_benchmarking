@@ -1,12 +1,45 @@
 """Command-line interface for genome-zarr-4bit."""
 
 import argparse
+import time
 
-from .convert import compress_zarr, decompress_zarr, fasta_to_zstd
+from .convert import compress_zarr, decompress_zarr, fasta_to_zstd, store_statistics
 
 
 def _add_overwrite(parser):
     parser.add_argument("--overwrite", action="store_true", help="Replace an existing destination store.")
+
+
+def _format_bytes(value):
+    units = ("B", "KiB", "MiB", "GiB", "TiB", "PiB")
+    amount = float(value)
+    for unit in units:
+        if amount < 1024 or unit == units[-1]:
+            return "{:.2f} {}".format(amount, unit)
+        amount /= 1024
+
+
+def _format_duration(seconds):
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return "{:02d}:{:02d}:{:05.2f}".format(int(hours), int(minutes), seconds)
+
+
+def _print_completion(command, source, output, elapsed, source_stats=None):
+    stats = store_statistics(output)
+    print("Completed: {}".format(command))
+    if source is not None:
+        print("Source: {}".format(source))
+    print("Destination: {}".format(output))
+    print("Elapsed: {} ({:.3f} seconds)".format(_format_duration(elapsed), elapsed))
+    print("Chromosomes: {:,}".format(stats["chromosomes"]))
+    print("Logical bases: {:,}".format(stats["logical_bases"]))
+    print("Packed 4-bit data: {}".format(_format_bytes(stats["packed_bytes"])))
+    print("Compression: {}".format(stats["compressor"]))
+    print("Destination apparent size: {}".format(_format_bytes(stats["apparent_bytes"])))
+    print("Destination allocated size: {}".format(_format_bytes(stats["allocated_bytes"])))
+    if source_stats is not None:
+        print("Source apparent size: {}".format(_format_bytes(source_stats["apparent_bytes"])))
 
 
 def main(argv=None) -> int:
@@ -33,15 +66,20 @@ def main(argv=None) -> int:
 
     args = parser.parse_args(argv)
     try:
+        source = getattr(args, "source", None)
+        source_stats = store_statistics(source) if source is not None else None
+        print("Starting {}...".format(args.command), flush=True)
+        started = time.perf_counter()
         if args.command == "fasta-to-zstd":
             output = fasta_to_zstd(args.fasta, args.destination, chunk_bases=args.chunk_bases, zstd_level=args.zstd_level, overwrite=args.overwrite)
         elif args.command == "decompress":
             output = decompress_zarr(args.source, args.destination, overwrite=args.overwrite)
         else:
             output = compress_zarr(args.source, args.destination, zstd_level=args.zstd_level, overwrite=args.overwrite)
+        elapsed = time.perf_counter() - started
     except (FileExistsError, FileNotFoundError, RuntimeError, ValueError) as exc:
         parser.error(str(exc))
-    print(output)
+    _print_completion(args.command, source, output, elapsed, source_stats)
     return 0
 
 

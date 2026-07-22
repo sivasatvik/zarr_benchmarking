@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "genome-zarr-4bit"
-version = "0.1.0"
+version = "0.1.1"
 description = "Stream FASTA genomes into packed 4-bit Zarr stores"
 readme = "README.md"
 requires-python = ">=3.9"

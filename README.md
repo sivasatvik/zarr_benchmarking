@@ -49,6 +49,11 @@ attributes document the encoding and each chromosome array has a
 `logical_length` attribute, which removes the one-base padding ambiguity for
 odd-length sequences.
 
+Each command prints `Starting <command>...` immediately, then a completion
+summary with elapsed time, chromosome and base counts, packed-data size,
+compression mode, and apparent and allocated destination storage. Transcoding
+commands also print the source store's apparent size.
+
 ## Python API
 
 ```python

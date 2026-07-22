@@ -14,7 +14,7 @@ except ImportError:  # Allows source-tree test discovery before dependencies are
 class ConversionTests(unittest.TestCase):
     def test_full_round_trip_preserves_packed_genome(self):
         from genome_zarr.codec import decode_4bit
-        from genome_zarr.convert import compress_zarr, decompress_zarr, fasta_to_zstd
+        from genome_zarr.convert import compress_zarr, decompress_zarr, fasta_to_zstd, store_statistics
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -36,6 +36,11 @@ class ConversionTests(unittest.TestCase):
                 self.assertTrue(np.array_equal(first[chromosome][:], plain[chromosome][:]))
                 self.assertTrue(np.array_equal(plain[chromosome][:], last[chromosome][:]))
                 self.assertEqual(decode_4bit(bytes(last[chromosome][:]), last[chromosome].attrs["logical_length"]), expected)
+            stats = store_statistics(recompressed)
+            self.assertEqual(stats["chromosomes"], 2)
+            self.assertEqual(stats["logical_bases"], 10)
+            self.assertEqual(stats["packed_bytes"], 6)
+            self.assertGreater(stats["apparent_bytes"], 0)
 
 
 if __name__ == "__main__":

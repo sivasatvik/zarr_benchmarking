@@ -32,6 +32,39 @@ def _prepare_destination(path: Path, overwrite: bool) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
+def store_statistics(store: Union[str, Path]) -> dict:
+    """Return logical and filesystem-size statistics for a packed store."""
+    zarr, _ = _require_dependencies()
+    path = Path(store)
+    group = zarr.open_group(str(path), mode="r")
+    _validate_packed_group(group)
+
+    chromosomes = 0
+    logical_bases = 0
+    packed_bytes = 0
+    for name in group.array_keys():
+        array = group[name]
+        chromosomes += 1
+        packed_bytes += int(array.shape[0])
+        logical_bases += int(array.attrs.get("logical_length", array.shape[0] * 2))
+
+    apparent_bytes = 0
+    allocated_bytes = 0
+    for entry in path.rglob("*"):
+        if entry.is_file():
+            stat = entry.stat()
+            apparent_bytes += stat.st_size
+            allocated_bytes += getattr(stat, "st_blocks", 0) * 512
+    return {
+        "chromosomes": chromosomes,
+        "logical_bases": logical_bases,
+        "packed_bytes": packed_bytes,
+        "apparent_bytes": apparent_bytes,
+        "allocated_bytes": allocated_bytes,
+        "compressor": group.attrs.get("compressor", "unknown"),
+    }
+
+
 def _record_name(header: str) -> str:
     name = header[1:].split()[0] if header[1:].split() else ""
     if not name or name in {".", ".."} or "/" in name:
