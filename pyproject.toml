@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "genome-zarr-4bit"
+version = "0.1.0"
+description = "Stream FASTA genomes into packed 4-bit Zarr stores"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.23",
+    "numcodecs>=0.11",
+    "zarr>=2.16,<3",
+]
+
+[project.scripts]
+genome-zarr = "genome_zarr.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["genome_zarr*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
