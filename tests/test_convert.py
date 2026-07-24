@@ -10,7 +10,10 @@ except ImportError:  # Allows source-tree test discovery before dependencies are
     zarr = None
 
 
-@unittest.skipUnless(zarr is not None, "zarr is not installed")
+ZARR_V3_AVAILABLE = zarr is not None and int(zarr.__version__.split(".", 1)[0]) >= 3
+
+
+@unittest.skipUnless(ZARR_V3_AVAILABLE, "Zarr v3 is not installed")
 class ConversionTests(unittest.TestCase):
     def test_full_round_trip_preserves_packed_genome(self):
         from genome_zarr.codec import decode_4bit
@@ -30,6 +33,9 @@ class ConversionTests(unittest.TestCase):
             plain = zarr.open_group(str(uncompressed), mode="r")
             last = zarr.open_group(str(recompressed), mode="r")
             self.assertEqual(first.attrs["compressor"], "zstd")
+            self.assertEqual(first.metadata.zarr_format, 3)
+            self.assertEqual(plain.metadata.zarr_format, 3)
+            self.assertEqual(last.metadata.zarr_format, 3)
             self.assertEqual(plain.attrs["compressor"], "none")
             self.assertEqual(last.attrs["compressor"], "zstd")
             for chromosome, expected in {"chr1": "ACGTNNN", "chr2": "TTA"}.items():
@@ -40,6 +46,7 @@ class ConversionTests(unittest.TestCase):
             self.assertEqual(stats["chromosomes"], 2)
             self.assertEqual(stats["logical_bases"], 10)
             self.assertEqual(stats["packed_bytes"], 6)
+            self.assertEqual(stats["zarr_format"], 3)
             self.assertGreater(stats["apparent_bytes"], 0)
 
 

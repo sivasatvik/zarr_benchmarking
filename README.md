@@ -1,11 +1,11 @@
 # genome-zarr-4bit
 
-`genome-zarr-4bit` turns a FASTA file into a standard, directory-backed Zarr v2
+`genome-zarr-4bit` turns a FASTA file into a standard, directory-backed Zarr v3
 group. Each chromosome is a one-dimensional `uint8` Zarr array containing two
 4-bit base codes per byte: `A=0`, `C=1`, `G=2`, `T=3`, and `N` (or any
 unsupported IUPAC base) `=4`. This is the same packed layout used by
-`zarr_compression_benchmark.py`; unlike its manual backend, Zarr and
-`numcodecs` own the chunking and compression.
+`zarr_compression_benchmark.py`; unlike its manual backend, Zarr owns the
+chunking and compression.
 
 The implementation scans the FASTA once for record sizes and streams it on the
 second pass. It does not load chromosomes into memory. The default logical
@@ -20,9 +20,11 @@ From this directory:
 python -m pip install .
 ```
 
-This deliberately uses the stable Zarr v2 API because its `numcodecs.Zstd`
-compressor is the format used in the existing benchmark. The package pins
-`zarr<3` to make stores reproducible across installations.
+The package requires Zarr v3 and explicitly creates every group with
+`zarr_format=3`. Zstandard compression uses Zarr v3's native
+`zarr.codecs.ZstdCodec`; no `numcodecs` dependency is used for this codec.
+Transcode commands can read an existing package-created v2 store as a
+migration source, but every destination they create is Zarr v3.
 
 ## Commands
 
@@ -51,7 +53,7 @@ odd-length sequences.
 
 Each command prints `Starting <command>...` immediately, then a completion
 summary with elapsed time, chromosome and base counts, packed-data size,
-compression mode, and apparent and allocated destination storage. Transcoding
+Zarr format, compression mode, and apparent and allocated destination storage. Transcoding
 commands also print the source store's apparent size.
 
 ## Python API

@@ -35,10 +35,12 @@ def _print_completion(command, source, output, elapsed, source_stats=None):
     print("Chromosomes: {:,}".format(stats["chromosomes"]))
     print("Logical bases: {:,}".format(stats["logical_bases"]))
     print("Packed 4-bit data: {}".format(_format_bytes(stats["packed_bytes"])))
+    print("Zarr format: {}".format(stats["zarr_format"]))
     print("Compression: {}".format(stats["compressor"]))
     print("Destination apparent size: {}".format(_format_bytes(stats["apparent_bytes"])))
     print("Destination allocated size: {}".format(_format_bytes(stats["allocated_bytes"])))
     if source_stats is not None:
+        print("Source Zarr format: {}".format(source_stats["zarr_format"]))
         print("Source apparent size: {}".format(_format_bytes(source_stats["apparent_bytes"])))
 
 

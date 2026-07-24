@@ -4,18 +4,20 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "genome-zarr-4bit"
-version = "0.1.1"
+version = "0.2.0"
 description = "Stream FASTA genomes into packed 4-bit Zarr stores"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.12"
 dependencies = [
     "numpy>=1.23",
-    "numcodecs>=0.11",
-    "zarr>=2.16,<3",
+    "zarr>=3,<4",
 ]
 
 [project.scripts]
 genome-zarr = "genome_zarr.cli:main"
+
+[project.urls]
+"Source Code" = "https://github.com/sivasatvik/zarr_benchmarking"
 
 [tool.setuptools.packages.find]
 include = ["genome_zarr*"]

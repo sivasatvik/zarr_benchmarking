@@ -14,11 +14,13 @@ DEFAULT_CHUNK_BASES = 1_048_576
 
 def _require_dependencies():
     try:
-        import numcodecs
         import zarr
     except ImportError as exc:  # pragma: no cover - exercised by CLI users
         raise RuntimeError("Install dependencies with: pip install genome-zarr-4bit") from exc
-    return zarr, numcodecs
+    major_version = int(zarr.__version__.split(".", 1)[0])
+    if major_version < 3:
+        raise RuntimeError("Zarr v3 is required; install genome-zarr-4bit with zarr>=3")
+    return zarr
 
 
 def _prepare_destination(path: Path, overwrite: bool) -> None:
@@ -34,7 +36,7 @@ def _prepare_destination(path: Path, overwrite: bool) -> None:
 
 def store_statistics(store: Union[str, Path]) -> dict:
     """Return logical and filesystem-size statistics for a packed store."""
-    zarr, _ = _require_dependencies()
+    zarr = _require_dependencies()
     path = Path(store)
     group = zarr.open_group(str(path), mode="r")
     _validate_packed_group(group)
@@ -62,6 +64,7 @@ def store_statistics(store: Union[str, Path]) -> dict:
         "apparent_bytes": apparent_bytes,
         "allocated_bytes": allocated_bytes,
         "compressor": group.attrs.get("compressor", "unknown"),
+        "zarr_format": group.metadata.zarr_format,
     }
 
 
@@ -112,8 +115,8 @@ def iter_fasta_lines(fasta: Path) -> Iterator[Tuple[str, str]]:
 
 
 def _zstd(level: int):
-    _, numcodecs = _require_dependencies()
-    return numcodecs.Zstd(level=level)
+    zarr = _require_dependencies()
+    return zarr.codecs.ZstdCodec(level=level)
 
 
 class _PackedArrayWriter:
@@ -151,6 +154,8 @@ class _PackedArrayWriter:
             data = np.frombuffer(self.buffer, dtype=np.uint8).copy()
             self.array[self.position : self.position + data.size] = data
             self.position += data.size
+            # Do not resize the old bytearray: a native codec may retain an
+            # exported view of it briefly. Replacing it is always safe.
             self.buffer.clear()
 
     def finish(self) -> None:
@@ -189,21 +194,21 @@ def fasta_to_zstd(
     if not fasta.is_file():
         raise FileNotFoundError(f"FASTA file does not exist: {fasta}")
     lengths = scan_fasta(fasta)
-    zarr, _ = _require_dependencies()
+    zarr = _require_dependencies()
     _prepare_destination(output, overwrite)
-    group = zarr.open_group(str(output), mode="w")
+    group = zarr.open_group(str(output), mode="w", zarr_format=3)
     group.attrs.update(_group_attributes(chunk_bases, "zstd"))
 
     arrays = {}
     chunk_bytes = chunk_bases // 2
     for name, length in lengths.items():
         encoded_bytes = (length + 1) // 2
-        array = group.create_dataset(
+        array = group.create_array(
             name,
             shape=(encoded_bytes,),
             chunks=(min(chunk_bytes, max(encoded_bytes, 1)),),
             dtype=np.uint8,
-            compressor=_zstd(zstd_level),
+            compressors=[_zstd(zstd_level)],
         )
         array.attrs.update({"logical_length": length, "encoding": "4bit"})
         arrays[name] = _PackedArrayWriter(array, chunk_bytes)
@@ -216,6 +221,8 @@ def fasta_to_zstd(
 
 
 def _validate_packed_group(group) -> None:
+    if getattr(group.metadata, "zarr_format", None) not in (2, 3):
+        raise ValueError("Source is not a supported Zarr v2 or v3 store")
     if group.attrs.get("schema") != "genome-zarr-4bit" or group.attrs.get("architecture") != "4bit":
         raise ValueError("Source is not a genome-zarr-4bit store created by this package")
     if not list(group.array_keys()):
@@ -225,7 +232,7 @@ def _validate_packed_group(group) -> None:
 def _transcode(
     source: Union[str, Path], destination: Union[str, Path], compressor, compressor_name: str, overwrite: bool
 ) -> Path:
-    zarr, _ = _require_dependencies()
+    zarr = _require_dependencies()
     source_path, output = Path(source), Path(destination)
     if not source_path.is_dir():
         raise FileNotFoundError(f"Zarr source does not exist: {source_path}")
@@ -234,7 +241,7 @@ def _transcode(
     source_group = zarr.open_group(str(source_path), mode="r")
     _validate_packed_group(source_group)
     _prepare_destination(output, overwrite)
-    destination_group = zarr.open_group(str(output), mode="w")
+    destination_group = zarr.open_group(str(output), mode="w", zarr_format=3)
     destination_group.attrs.update(dict(source_group.attrs))
     destination_group.attrs["compressor"] = compressor_name
 
@@ -242,12 +249,12 @@ def _transcode(
         source_array = source_group[name]
         if source_array.ndim != 1 or source_array.dtype != np.dtype("uint8"):
             raise ValueError(f"Array {name!r} is not a one-dimensional uint8 packed chromosome")
-        target = destination_group.create_dataset(
+        target = destination_group.create_array(
             name,
             shape=source_array.shape,
             chunks=source_array.chunks,
             dtype=np.uint8,
-            compressor=compressor,
+            compressors=compressor,
         )
         target.attrs.update(dict(source_array.attrs))
         step = source_array.chunks[0]
