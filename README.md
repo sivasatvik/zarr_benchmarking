@@ -40,10 +40,17 @@ genome-zarr compress /data/genome-uncompressed.zarr /data/genome-recompressed.za
 ```
 
 Destinations must be new unless `--overwrite` is supplied. To select a chunk
-size or Zstandard level:
+size or Zstandard level or number of CPU workers:
 
 ```bash
-genome-zarr fasta-to-zstd genome.fa /data/genome.zarr --chunk-bases 2097152 --zstd-level 6
+# FASTA -> packed 4-bit Zarr with Zstandard compression (chunk size, level, workers)
+genome-zarr fasta-to-zstd genome.fa /data/genome.zarr --chunk-bases 2097152 --zstd-level 6 --num-workers 16
+
+# compressed -> uncompressed with parallel workers
+genome-zarr decompress /data/genome.zarr /data/genome-uncompressed.zarr --num-workers 8
+
+# uncompressed -> Zstandard (recompression) with parallel workers
+genome-zarr compress /data/genome-uncompressed.zarr /data/genome-recompressed.zarr --zstd-level 6 --num-workers 8
 ```
 
 `--chunk-bases` must be even, since two bases occupy each byte. Store-level

@@ -53,17 +53,20 @@ def main(argv=None) -> int:
     fasta.add_argument("destination")
     fasta.add_argument("--chunk-bases", type=int, default=1_048_576, help="Even number of bases per Zarr chunk (default: 1048576).")
     fasta.add_argument("--zstd-level", type=int, default=3)
+    fasta.add_argument("--num-workers", type=int, default=None, help="Number of parallel worker processes.")
     _add_overwrite(fasta)
 
     decompress = subparsers.add_parser("decompress", help="Create an uncompressed copy of a packed store.")
     decompress.add_argument("source")
     decompress.add_argument("destination")
+    decompress.add_argument("--num-workers", type=int, default=None, help="Number of parallel worker processes.")
     _add_overwrite(decompress)
 
     compress = subparsers.add_parser("compress", help="Create a Zstd-compressed copy of a packed store.")
     compress.add_argument("source")
     compress.add_argument("destination")
     compress.add_argument("--zstd-level", type=int, default=3)
+    compress.add_argument("--num-workers", type=int, default=None, help="Number of parallel worker processes.")
     _add_overwrite(compress)
 
     args = parser.parse_args(argv)
@@ -73,11 +76,17 @@ def main(argv=None) -> int:
         print("Starting {}...".format(args.command), flush=True)
         started = time.perf_counter()
         if args.command == "fasta-to-zstd":
-            output = fasta_to_zstd(args.fasta, args.destination, chunk_bases=args.chunk_bases, zstd_level=args.zstd_level, overwrite=args.overwrite)
+            output = fasta_to_zstd(
+                args.fasta,
+                args.destination,
+                chunk_bases=args.chunk_bases,
+                zstd_level=args.zstd_level,
+                overwrite=args.overwrite,
+                num_workers=args.num_workers)
         elif args.command == "decompress":
-            output = decompress_zarr(args.source, args.destination, overwrite=args.overwrite)
+            output = decompress_zarr(args.source, args.destination, overwrite=args.overwrite, num_workers=args.num_workers)
         else:
-            output = compress_zarr(args.source, args.destination, zstd_level=args.zstd_level, overwrite=args.overwrite)
+            output = compress_zarr(args.source, args.destination, zstd_level=args.zstd_level, overwrite=args.overwrite, num_workers=args.num_workers)
         elapsed = time.perf_counter() - started
     except (FileExistsError, FileNotFoundError, RuntimeError, ValueError) as exc:
         parser.error(str(exc))

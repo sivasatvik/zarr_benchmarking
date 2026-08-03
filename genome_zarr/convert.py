@@ -3,6 +3,8 @@
 import shutil
 from pathlib import Path
 from typing import Dict, Iterator, Tuple, Union
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import os
 
 import numpy as np
 
@@ -32,6 +34,30 @@ def _prepare_destination(path: Path, overwrite: bool) -> None:
         else:
             path.unlink()
     path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _process_record_worker(args: tuple) -> None:
+    """Worker task: Seek to byte position, read FASTA record, encode, and write to Zarr."""
+    fasta_path, output_path, name, start_byte, end_byte, length, chunk_bytes, zstd_level = args
+
+    import zarr
+    from .convert import _PackedArrayWriter, _zstd
+
+    group = zarr.open_group(str(output_path), mode="a")
+    array = group[name]
+    writer = _PackedArrayWriter(array, chunk_bytes)
+
+    with open(fasta_path, "rb") as handle:
+        handle.seek(start_byte)
+        while handle.tell() < end_byte:
+            line = handle.readline()
+            if not line or line.startswith(b">"):
+                break
+            stripped = line.strip()
+            if stripped:
+                writer.feed(stripped.decode("ascii"))
+
+    writer.finish()
 
 
 def store_statistics(store: Union[str, Path]) -> dict:
@@ -96,6 +122,38 @@ def scan_fasta(fasta: Path) -> Dict[str, int]:
     if not lengths:
         raise ValueError("FASTA contains no records")
     return lengths
+
+
+def scan_fasta_indexed(fasta: Path) -> Dict[str, Tuple[int, int, int]]:
+    """Scan FASTA in binary mode returning {record_name: (start_byte, end_byte, length_bases)}."""
+    records = {}
+    current_name = None
+    start_byte = 0
+    current_bases = 0
+
+    with fasta.open("rb") as handle:
+        while True:
+            pos = handle.tell()
+            line = handle.readline()
+            if not line:
+                if current_name is not None:
+                    records[current_name] = (start_byte, pos, current_bases)
+                break
+
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith(b">"):
+                if current_name is not None:
+                    records[current_name] = (start_byte, pos, current_bases)
+                header = stripped.decode("ascii")
+                current_name = _record_name(header)
+                start_byte = handle.tell()
+                current_bases = 0
+            else:
+                current_bases += len(stripped)
+
+    return records
 
 
 def iter_fasta_lines(fasta: Path) -> Iterator[Tuple[str, str]]:
@@ -186,6 +244,7 @@ def fasta_to_zstd(
     chunk_bases: int = DEFAULT_CHUNK_BASES,
     zstd_level: int = 3,
     overwrite: bool = False,
+    num_workers: int = None,
 ) -> Path:
     """Create a Zstandard-compressed packed-4-bit Zarr group from FASTA."""
     if chunk_bases <= 0 or chunk_bases % 2:
@@ -193,7 +252,15 @@ def fasta_to_zstd(
     fasta, output = Path(fasta_path), Path(destination)
     if not fasta.is_file():
         raise FileNotFoundError(f"FASTA file does not exist: {fasta}")
-    lengths = scan_fasta(fasta)
+
+    if num_workers is None:
+        num_workers = min(os.cpu_count() or 1, 16)
+
+    print(f"Started with {num_workers} parallel workers", flush=True)
+
+    # Indexed Scan
+    records = scan_fasta_indexed(fasta)
+    # lengths = scan_fasta(fasta)
     zarr = _require_dependencies()
     _prepare_destination(output, overwrite)
     group = zarr.open_group(str(output), mode="w", zarr_format=3)
@@ -201,7 +268,11 @@ def fasta_to_zstd(
 
     arrays = {}
     chunk_bytes = chunk_bases // 2
-    for name, length in lengths.items():
+    worker_tasks = []
+
+    print(f"Total number of scanned records: {len(records)}", flush=True)
+
+    for name, (start_byte, end_byte, length) in records.items():
         encoded_bytes = (length + 1) // 2
         array = group.create_array(
             name,
@@ -211,12 +282,28 @@ def fasta_to_zstd(
             compressors=[_zstd(zstd_level)],
         )
         array.attrs.update({"logical_length": length, "encoding": "4bit"})
-        arrays[name] = _PackedArrayWriter(array, chunk_bytes)
+        # Prepare task tuple for pool
+        worker_tasks.append((
+            str(fasta), str(output), name, start_byte, end_byte, length, chunk_bytes, zstd_level
+        ))
+        # arrays[name] = _PackedArrayWriter(array, chunk_bytes)
 
-    for name, sequence_line in iter_fasta_lines(fasta):
-        arrays[name].feed(sequence_line)
-    for writer in arrays.values():
-        writer.finish()
+    total_records = len(worker_tasks)
+    completed = 0
+
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = [executor.submit(_process_record_worker, task) for task in worker_tasks]
+
+        for future in as_completed(futures):
+            future.result()
+            completed += 1
+            pct = (completed / total_records) * 100
+            print(f"Progress: {completed}/{total_records} records converted ({pct:.1f}%)", flush=True)
+
+    # for name, sequence_line in iter_fasta_lines(fasta):
+    #     arrays[name].feed(sequence_line)
+    # for writer in arrays.values():
+    #     writer.finish()
     return output
 
 
@@ -230,7 +317,7 @@ def _validate_packed_group(group) -> None:
 
 
 def _transcode(
-    source: Union[str, Path], destination: Union[str, Path], compressor, compressor_name: str, overwrite: bool
+    source: Union[str, Path], destination: Union[str, Path], compressor, compressor_name: str, overwrite: bool, num_workers: int = None
 ) -> Path:
     zarr = _require_dependencies()
     source_path, output = Path(source), Path(destination)
@@ -245,32 +332,67 @@ def _transcode(
     destination_group.attrs.update(dict(source_group.attrs))
     destination_group.attrs["compressor"] = compressor_name
 
-    for name in source_group.array_keys():
+    # Create destination arrays (metadata) in the main process to avoid races,
+    # then copy array data in parallel workers.
+    names = list(source_group.array_keys())
+    worker_tasks = []
+
+    for name in names:
         source_array = source_group[name]
         if source_array.ndim != 1 or source_array.dtype != np.dtype("uint8"):
             raise ValueError(f"Array {name!r} is not a one-dimensional uint8 packed chromosome")
-        target = destination_group.create_array(
+        destination_group.create_array(
             name,
             shape=source_array.shape,
             chunks=source_array.chunks,
             dtype=np.uint8,
             compressors=compressor,
         )
-        target.attrs.update(dict(source_array.attrs))
-        step = source_array.chunks[0]
-        for start in range(0, source_array.shape[0], step):
-            end = min(start + step, source_array.shape[0])
-            target[start:end] = source_array[start:end]
+        destination_group[name].attrs.update(dict(source_array.attrs))
+        worker_tasks.append((str(source_path), str(output), name))
+
+    if num_workers is None:
+        num_workers = min(os.cpu_count() or 1, 16)
+
+    print(f"Started transcode with {num_workers} parallel workers", flush=True)
+
+    total = len(worker_tasks)
+    completed = 0
+
+    def _transcode_array_worker(args: tuple) -> None:
+        """Worker task: open source and destination groups and copy array slices."""
+        source_path, output_path, name = args
+        import zarr
+
+        src_group = zarr.open_group(str(source_path), mode="r")
+        dst_group = zarr.open_group(str(output_path), mode="a")
+        src = src_group[name]
+        dst = dst_group[name]
+        step = src.chunks[0] if src.chunks else src.shape[0]
+        for start in range(0, src.shape[0], step):
+            end = min(start + step, src.shape[0])
+            dst[start:end] = src[start:end]
+
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = [executor.submit(_transcode_array_worker, task) for task in worker_tasks]
+        for future in as_completed(futures):
+            future.result()
+            completed += 1
+            pct = (completed / total) * 100
+            print(f"Progress: {completed}/{total} arrays copied ({pct:.1f}%)", flush=True)
+
     return output
 
 
-def decompress_zarr(source: Union[str, Path], destination: Union[str, Path], *, overwrite: bool = False) -> Path:
+def decompress_zarr(
+    source: Union[str, Path], destination: Union[str, Path], *, overwrite: bool = False, num_workers: int = None
+) -> Path:
     """Copy a compressed packed store into an otherwise identical uncompressed store."""
-    return _transcode(source, destination, None, "none", overwrite)
+    return _transcode(source, destination, None, "none", overwrite, num_workers=num_workers)
 
 
 def compress_zarr(
-    source: Union[str, Path], destination: Union[str, Path], *, zstd_level: int = 3, overwrite: bool = False
+    source: Union[str, Path], destination: Union[str, Path], *, zstd_level: int = 3, overwrite: bool = False, num_workers: int = None
 ) -> Path:
     """Copy an uncompressed packed store (or recompress any packed store) with Zstd."""
-    return _transcode(source, destination, _zstd(zstd_level), "zstd", overwrite)
+    return _transcode(source, destination, _zstd(zstd_level), "zstd", overwrite, num_workers=num_workers)
