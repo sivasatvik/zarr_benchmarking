@@ -309,14 +309,24 @@ class ChunkedGenomeZarrDataset(IterableDataset):
         self.seed = int(seed)
         self.return_metadata = return_metadata
 
+        # Parse the manifest / build the record index ONCE, in the constructing
+        # (main) process. DataLoader workers then inherit this via fork instead
+        # of each re-reading the manifest in __iter__. Only the lightweight
+        # record metadata is kept here; the Zarr array handle is not picklable
+        # across processes and is opened lazily per worker in __iter__.
+        index = _load_store_index(self.store_path)
+        self._layout = index.layout
+        self._array_name = index.array_name
+        self._records = index.records
+        self.compressor = index.compressor
+
     def _item(self, chromosome: str, start: int, sequence: np.ndarray):
         if self.return_metadata:
             return {"sequence": sequence, "chromosome": chromosome, "start": start, "end": start + self.window_size}
         return sequence
 
     def __iter__(self):
-        index = _load_store_index(self.store_path)
-        available = {record.name for record in index.records}
+        available = {record.name for record in self._records}
         if not available:
             raise ValueError("Store contains no chromosome arrays")
         names = sorted(available) if self.chromosomes is None else list(self.chromosomes)
@@ -333,9 +343,13 @@ class ChunkedGenomeZarrDataset(IterableDataset):
             record_rng.shuffle(names)
         names = names[worker_id::worker_count]
 
-        record_map = {record.name: record for record in index.records}
-        if index.layout == "flat-packed":
-            array = index.group[index.array_name]
+        # Open the Zarr array lazily, once per worker. The record index was
+        # parsed in __init__ and inherited here, so no worker re-reads the
+        # manifest.
+        group = _open_group(self.store_path)
+        record_map = {record.name: record for record in self._records}
+        if self._layout == "flat-packed":
+            array = group[self._array_name]
             chunk_bytes = int(array.chunks[0] if array.chunks else array.shape[0])
             for chromosome in names:
                 record = record_map[chromosome]
@@ -366,7 +380,7 @@ class ChunkedGenomeZarrDataset(IterableDataset):
                             yield self._item(chromosome, start, bases[offset:offset + self.window_size].copy())
         else:
             for chromosome in names:
-                array = index.group[chromosome]
+                array = group[chromosome]
                 if array.ndim != 1 or np.dtype(array.dtype) != np.dtype(np.uint8):
                     raise ValueError(f"Array {chromosome!r} is not a one-dimensional uint8 packed chromosome")
                 logical_length = int(array.attrs.get("logical_length", int(array.shape[0]) * 2))

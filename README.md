@@ -154,3 +154,32 @@ reports the declared compressor and total windows). To test one chromosome or a 
 `--chromosome chr1`; repeat `--chromosome` to select several records. Use the
 same command for an output from `genome-zarr decompress`; it will report
 `compressor: none`.
+
+## Storage training benchmark
+
+`train_storage_benchmark.py` compares direct indexed FASTA reads with packed
+Zarr reads using the same deterministic sample windows and the same small
+next-base-prediction model. The first run creates a FASTA `.fai` index (one
+scan of the FASTA) and a sampled benchmark manifest. These setup costs are not
+included in the CSV training timings; retain both files for future runs.
+
+```bash
+python train_storage_benchmark.py \
+  --build-manifest --setup-only \
+  --manifest /gpfs/scratch/sm12779/imgvr_windows_1025_100000.npz \
+  --fasta-index /gpfs/scratch/sm12779/imgvr.fasta.fai --samples 100000 \
+  --window-size 1024
+
+python train_storage_benchmark.py \
+  --manifest /gpfs/scratch/sm12779/imgvr_windows_1025_100000.npz \
+  --fasta-index /gpfs/scratch/sm12779/imgvr.fasta.fai \
+  --window-size 1024 --batch-size 64 --steps 200 \
+  --num-workers 2 --results imgvr_storage_training.csv
+```
+
+The defaults already point to the IMGVR Zarr store and FASTA supplied for this
+repository. Repeat the exact command without `--build-manifest` to reuse the
+same sample windows. Use `--backend fasta` or `--backend zarr` for isolated
+runs, and repeat each configuration several times. The CSV reports dataset
+construction time, first-batch latency, total training time (including later
+batch delivery), bases per second, and final loss.

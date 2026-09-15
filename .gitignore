@@ -1,3 +1,10 @@
 zarr_compression_benchmark/stores*
 hg38_benchmark_data/*_data
+logs/
+dist/
+build/
+genome-zarr-data/
+dataloader_benchmark/
+presentation_assets/
+dataloader_scaling_plots/
 __pycache__
